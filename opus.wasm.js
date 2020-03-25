@@ -40,6 +40,35 @@ var OpusDecoder;
         return value
     }
 
+    function ParseIntTag(data, position, size)
+    {
+        switch (size) {
+            case 1: 
+                return data.getInt8(position);
+            case 2:
+                return data.getInt16(position);
+            case 3:
+                return ReadInt24(data, position);
+            case 4: 
+                return data.getInt32(position);
+            default:
+                throw new Error("Invalid size");
+        }
+    }
+
+    function ReadInt24(data, position)
+    {
+        var first = data.getInt8(position);
+        var sign = first >> 7;
+        var value = first & 0b1111111;
+
+        value = (value << 8) | data.getUint8(position);
+        value = (value << 8) | data.getUint8(position);
+
+        return sign === 1 ? -value : value;
+    }
+
+
     function CalculateAudioBufferSize(rate, channels, duration) {
         return rate / 1e3 * channels * duration
     }
@@ -48,7 +77,11 @@ var OpusDecoder;
         var frequency = 48e3;
         var channels = 1;
         var bufferSize = 2048;
-        var length = CalculateAudioBufferSize(frequency, channels, duration);
+        // the true size should be "duration - codecDelay"
+        // but we also write the "discardpadding" at the end 
+        // of the buffer before discarding it, so we need 1 opus frame of
+        // extra space. max size of a frame is 120ms
+        var length = CalculateAudioBufferSize(frequency, channels, duration + 120);
         _audioBuffer = new Float32Array(length);
         if (!_outputBuffer) {
             _outputPointer = Module._malloc(bufferSize << 2);
@@ -64,8 +97,9 @@ var OpusDecoder;
     function DestroyDecoder() {
         Module._destroy_decoder(_decoder);
         _decoder = null;
-        _outputOffset = 0
+        _outputOffset = 0;
     }
+    
     OpusDecoder = function DecodeOpusTrack(buffer, callback, outputBuffer) {
         _queue.unshift([buffer, callback, outputBuffer]);
         if (_state == PAUSED_STATE) DecodeNextTrack()
@@ -82,16 +116,18 @@ var OpusDecoder;
             _audioContext = ctx || null;
             _state = WAIT_STATE;
             try {
-                ParseMaster(new DataView(buffer), 0, buffer.byteLength)
+                ParseMaster(new DataView(buffer), 0, buffer.byteLength);
             } catch (e) {
                 error = e
             }
+            var end = _outputOffset;
+            var outputBuffer = _audioBuffer.buffer.slice(0, end * 4);
             DestroyDecoder();
             if (error) {
                 callback(error)
             } else {
                 var time = (performance.now() - start) / 1e3;
-                callback(null, _audioBuffer, time)
+                callback(null, outputBuffer, time)
             }
             _audioBuffer = null;
             _state = READY_STATE;
@@ -99,13 +135,34 @@ var OpusDecoder;
         } else _state = PAUSED_STATE
     }
 
+    function WriteOutput (ret) {
+        if (ret + _outputOffset > 0) {
+            var tempBuffer;
+            var writePosition = _outputOffset;
+            if (_outputOffset < 0) {
+                var trim = -_outputOffset;
+                tempBuffer = new Float32Array(Module.HEAPU8.buffer, _outputPointer + trim * 4, ret - trim);
+                writePosition = 0;
+            }
+            else {
+                tempBuffer = new Float32Array(Module.HEAPU8.buffer, _outputPointer, ret);
+            }
+
+            if (writePosition + tempBuffer.length > _audioBuffer.length)
+                throw new Error("Buffer overflow");
+
+            _audioBuffer.set(tempBuffer, writePosition);
+        }
+
+        _outputOffset += ret;
+    }
+
     function ParseFrame(data) {
         var length = data.length;
         Module.HEAPU8.set(data, _inputPointer);
         var ret = Module._decode_frame(_decoder, _inputPointer, length, _outputPointer, 4096);
         if (ret > 0) {
-            _audioBuffer.set(new Float32Array(Module.HEAPU8.buffer, _outputPointer, ret), _outputOffset);
-            _outputOffset += ret
+            WriteOutput(ret);
         } else {
             throw new Error("Failed to parse frame")
         }
@@ -136,6 +193,22 @@ var OpusDecoder;
         CreateDecoder(duration)
     }
 
+    function ParseDiscard(data, position, size) {
+        // NOTE discard in an integer
+        // postive values are trailing, negative are leading
+        // value is in nanoseconds
+        var discardDuration = ParseIntTag(data, position, size);
+        if (discardDuration < 0)
+            throw new Error("Cannot discard leading block data");
+        var discardFrames = Math.floor(discardDuration * 0.000048);
+        _outputOffset -= discardFrames;
+    }
+
+    function ParseDelay(data, position, size) {
+        var discardDuration = ReadVInt(data, position, size, 0xFF);
+        _outputOffset = -Math.floor(discardDuration * 0.000048)
+    }
+
     function TestOpus(data, position) {
         for (var i = 0, l = 6; i < l; i++) {
             if (data.getUint8(position + i) != OPUS_SIG[i]) throw new Error("Contains non opus data")
@@ -158,22 +231,30 @@ var OpusDecoder;
             size = ReadVInt(data, position, sizeLength, mask);
             position += sizeLength;
             switch (id) {
-                case 408125543:
-                case 357149030:
-                case 524531317:
-                case 374648427:
-                case 174:
+                case 408125543: // Segment
+                case 357149030: // Info
+                case 524531317: // Cluster
+                case 374648427: // Tracks
+                case 174:       // TrackEntry
+                case 160:       // BlockGroup
                     ParseMaster(data, position, size);
                     break;
-                case 17545:
+                case 17545:     // Duration
                     ParseDuration(data, position, size);
                     break;
-                case 134:
+                case 22186:     // CodecDelay
+                    ParseDelay(data, position, size);
+                    break;
+                case 30114:     // DiscardPadding
+                    ParseDiscard(data, position, size);
+                    break;
+                case 134:       // CodecID
                     TestOpus(data, position, size);
                     break;
-                case 163:
+                case 161:       // Block
+                case 163:       // SimpleBlock
                     ParseBlock(data, position, size);
-                    break
+                    break;
             }
             position += size
         }
